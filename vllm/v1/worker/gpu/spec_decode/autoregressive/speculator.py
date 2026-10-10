@@ -40,6 +40,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.sample_src_positions = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
+        # Draft prefill rows whose output no draft reads (see _prefill). The MoE
+        # router of the draft layer gives these rows no experts.
+        self.draft_prefill_padding = torch.ones(
+            self.max_num_tokens, dtype=torch.bool, device=device
+        )
+        self.skip_unused_prefill_rows = False
 
         self.inputs_embeds: torch.Tensor | None = None
 
@@ -49,6 +55,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+        # Only the last accepted row of each request feeds the next draft. Let the
+        # routers of the MTP block skip padding rows, so that _prefill can mark the
+        # other rows as padding and the MoE reads only the experts of used rows.
+        for name, module in self.model.named_modules():
+            router = getattr(module, "router", None)
+            if "mtp_block" in name and hasattr(router, "skip_padding"):
+                router.skip_padding = True
+                self.skip_unused_prefill_rows = True
+        if self.skip_unused_prefill_rows:
+            logger.info("Draft prefill: the MTP MoE skips rows that no draft reads.")
         if not self.supports_mm_inputs:
             return
 
@@ -404,9 +420,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_buffers: InputBatch | InputBuffers = self.input_buffers
-        is_padding = None
         if self.pcp_manager is not None:
             input_buffers = self.pcp_manager.get_draft_input_buffers(self.input_buffers)
             is_padding = input_buffers.is_padding[:num_tokens]
@@ -479,6 +495,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         sample_src_positions = positions + 1
         idx_mapping = self.idx_mapping[:num_reqs]
 
+        # Mark every row except the last accepted row of each request as padding.
+        # Attention and the KV writes still use all rows. Padded requests have
+        # index 0, so row 0 always stays valid. The mask is filled on the GPU from
+        # last_token_indices, so a captured CUDA graph refills it at each replay.
+        is_padding = None
+        if self.skip_unused_prefill_rows and self.pcp_manager is None:
+            is_padding = self.draft_prefill_padding[:num_tokens]
+            is_padding.fill_(True)
+            # index_fill_ takes the value as a scalar. Indexed assignment of a
+            # Python bool copies a CPU tensor, which CUDA graph capture refuses.
+            is_padding.index_fill_(0, last_token_indices, False)
+
         last_hidden_states, hidden_states = self._run_model(
             num_tokens,
             attn_metadata,
@@ -486,6 +514,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            is_padding=is_padding,
         )
         if self.pcp_manager is not None:
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
